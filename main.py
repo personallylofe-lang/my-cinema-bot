@@ -1,535 +1,370 @@
 
 import os
+import sqlite3
 import requests
 import telebot
 from flask import Flask, request
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from datetime import date
 
-TOKEN = os.environ["BOT_TOKEN"]
-TMDB_KEY = os.environ["TMDB_KEY"]
-WEBHOOK_URL = os.environ["RENDER_EXTERNAL_URL"]
+# SETTINGS
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+TMDB_KEY = os.getenv("TMDB_KEY")
+BASE_URL = os.getenv("RENDER_EXTERNAL_URL")
 
-bot = telebot.TeleBot(TOKEN)
+if not BOT_TOKEN or not TMDB_KEY or not BASE_URL:
+    raise ValueError("BOT_TOKEN, TMDB_KEY, RENDER_EXTERNAL_URL required")
+
+bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-BASE = "https://api.themoviedb.org/3"
+TMDB = "https://api.themoviedb.org/3"
 IMG = "https://image.tmdb.org/t/p/w500"
 
-LANGUAGES = {
-    "ml": "ml-IN",
-    "malayalam": "ml-IN",
-    "ta": "ta-IN",
-    "tamil": "ta-IN",
-    "hi": "hi-IN",
-    "hindi": "hi-IN",
-    "en": "en-US",
-    "english": "en-US"
-}
+# FILE DATABASE
+db = sqlite3.connect("movies.db", check_same_thread=False)
+db.execute("""
+CREATE TABLE IF NOT EXISTS files (
+ id INTEGER PRIMARY KEY AUTOINCREMENT,
+ chat_id INTEGER,
+ title TEXT,
+ file_id TEXT,
+ kind TEXT
+)
+""")
+db.commit()
 
 
 def tmdb(path, params=None):
-    p = dict(params or {})
+    p = params or {}
     p["api_key"] = TMDB_KEY
-    r = requests.get(BASE + path, params=p, timeout=25)
+    r = requests.get(TMDB + path, params=p, timeout=20)
     r.raise_for_status()
     return r.json()
 
 
-@app.route("/", methods=["GET"])
-def home():
-    return "MY CINEMA BOT RUNNING ❤️"
+def movie_info(movie_id):
+    m = tmdb(f"/movie/{movie_id}", {"append_to_response": "credits,videos"})
+    poster = IMG + m["poster_path"] if m.get("poster_path") else None
 
+    text = (
+        f"🎬 <b>{m.get('title')}</b>\n"
+        f"⭐ Rating: {m.get('vote_average', 'N/A')}/10\n"
+        f"📅 Release: {m.get('release_date', 'N/A')}\n\n"
+        f"📖 <b>Story:</b>\n{m.get('overview') or 'No story available'}\n\n"
+    )
 
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    try:
-        update = telebot.types.Update.de_json(
-            request.get_data().decode("utf-8")
+    cast = m.get("credits", {}).get("cast", [])[:5]
+    if cast:
+        text += "🎭 <b>Cast:</b>\n"
+        text += ", ".join(x["name"] for x in cast)
+
+    trailer = None
+    for v in m.get("videos", {}).get("results", []):
+        if v["site"] == "YouTube" and v["type"] == "Trailer":
+            trailer = "https://youtube.com/watch?v=" + v["key"]
+            break
+
+    if trailer:
+        text += f"\n\n▶️ <a href='{trailer}'>Watch Trailer</a>"
+
+    if poster:
+        bot.send_photo(
+            CURRENT_CHAT[0], poster,
+            caption=text, parse_mode="HTML"
         )
-        bot.process_new_updates([update])
-        return "OK", 200
-    except Exception as e:
-        print("Webhook error:", e)
-        return "ERROR", 500
+    else:
+        bot.send_message(CURRENT_CHAT[0], text, parse_mode="HTML")
 
 
-def show_list(chat_id, results, heading, kind="movie"):
+CURRENT_CHAT = [None]
+
+
+def show_movies(chat_id, results):
     if not results:
-        bot.send_message(chat_id, "❌ No results found.")
+        bot.send_message(chat_id, "❌ Movies not found.")
         return
 
-    kb = InlineKeyboardMarkup()
-
-    for item in results[:10]:
-        name = item.get("title") or item.get("name") or "Unknown"
-        year = (
-            item.get("release_date") or
-            item.get("first_air_date") or ""
-        )[:4]
-
-        kb.add(InlineKeyboardButton(
+    markup = telebot.types.InlineKeyboardMarkup()
+    for m in results[:10]:
+        name = m.get("title") or m.get("name")
+        year = (m.get("release_date") or m.get("first_air_date") or "")[:4]
+        markup.add(telebot.types.InlineKeyboardButton(
             f"🎬 {name} ({year})",
-            callback_data=f"{kind}_{item['id']}"
+            callback_data=f"movie_{m['id']}"
         ))
 
-    bot.send_message(chat_id, heading, reply_markup=kb)
+    bot.send_message(chat_id, "🎬 Select a movie:", reply_markup=markup)
 
 
-def show_movie(chat_id, movie_id):
-    data = tmdb(f"/movie/{movie_id}")
-    credits = tmdb(f"/movie/{movie_id}/credits")
-    videos = tmdb(f"/movie/{movie_id}/videos")
-
-    title = data.get("title", "Unknown")
-    rating = data.get("vote_average", 0)
-    release = data.get("release_date", "Unknown")
-    overview = data.get("overview", "Story unavailable")
-    runtime = data.get("runtime", 0)
-
-    cast = credits.get("cast", [])
-    cast_names = ", ".join(
-        x["name"] for x in cast[:6]
-    ) or "Not available"
-
-    trailer = None
-    for video in videos.get("results", []):
-        if video.get("site") == "YouTube" and video.get("type") == "Trailer":
-            trailer = "https://www.youtube.com/watch?v=" + video["key"]
-            break
-
-    caption = (
-        f"🎬 {title}\n\n"
-        f"⭐ Rating: {rating}/10\n"
-        f"📅 Release: {release}\n"
-        f"⏱️ Runtime: {runtime} minutes\n\n"
-        f"📖 Story:\n{overview[:450]}\n\n"
-        f"🎭 Cast:\n{cast_names}"
-    )
-
-    kb = InlineKeyboardMarkup()
-
-    if trailer:
-        kb.add(InlineKeyboardButton(
-            "▶️ WATCH TRAILER", url=trailer
-        ))
-
-    poster = data.get("poster_path")
-
-    if poster:
-        bot.send_photo(
-            chat_id, IMG + poster,
-            caption=caption[:1024],
-            reply_markup=kb
-        )
-    else:
-        bot.send_message(chat_id, caption, reply_markup=kb)
-
-
-def show_tv(chat_id, tv_id):
-    data = tmdb(f"/tv/{tv_id}")
-    videos = tmdb(f"/tv/{tv_id}/videos")
-    credits = tmdb(f"/tv/{tv_id}/credits")
-
-    title = data.get("name", "Unknown")
-    rating = data.get("vote_average", 0)
-    overview = data.get("overview", "Story unavailable")
-    seasons = data.get("number_of_seasons", 0)
-
-    cast = credits.get("cast", [])
-    cast_names = ", ".join(
-        x["name"] for x in cast[:5]
-    ) or "Not available"
-
-    trailer = None
-    for video in videos.get("results", []):
-        if video.get("site") == "YouTube" and video.get("type") == "Trailer":
-            trailer = "https://www.youtube.com/watch?v=" + video["key"]
-            break
-
-    caption = (
-        f"📺 {title}\n\n"
-        f"⭐ Rating: {rating}/10\n"
-        f"📚 Seasons: {seasons}\n\n"
-        f"📖 Story:\n{overview[:450]}\n\n"
-        f"🎭 Cast:\n{cast_names}"
-    )
-
-    kb = InlineKeyboardMarkup()
-    if trailer:
-        kb.add(InlineKeyboardButton(
-            "▶️ WATCH TRAILER", url=trailer
-        ))
-
-    poster = data.get("poster_path")
-    if poster:
-        bot.send_photo(
-            chat_id, IMG + poster,
-            caption=caption[:1024],
-            reply_markup=kb
-        )
-    else:
-        bot.send_message(chat_id, caption, reply_markup=kb)
-
-
-def show_actor(chat_id, person_id):
-    data = tmdb(f"/person/{person_id}")
-    credits = tmdb(f"/person/{person_id}/movie_credits")
-
-    name = data.get("name", "Unknown")
-    bio = data.get("biography", "Biography unavailable")
-    known = data.get("known_for_department", "Unknown")
-
-    movies = credits.get("cast", [])
-    movies.sort(
-        key=lambda x: x.get("popularity", 0),
-        reverse=True
-    )
-
-    titles = "\n".join(
-        "🎬 " + x.get("title", "Unknown")
-        for x in movies[:8]
-    )
-
-    caption = (
-        f"🎭 ACTOR: {name}\n\n"
-        f"⭐ Known for: {known}\n\n"
-        f"📖 Biography:\n{bio[:450]}\n\n"
-        f"🎬 Popular Movies:\n{titles or 'Not available'}"
-    )
-
-    photo = data.get("profile_path")
-    if photo:
-        bot.send_photo(
-            chat_id, IMG + photo,
-            caption=caption[:1024]
-        )
-    else:
-        bot.send_message(chat_id, caption[:4000])
-
-
-@bot.message_handler(commands=["start", "help"])
+@bot.message_handler(commands=["start"])
 def start(message):
     bot.reply_to(
         message,
-        "🎬 WELCOME TO MY CINEMA HELP BOT ❤️\n\n"
-        "🔎 /search Premalu - Search Movies\n"
-        "🔥 /trending - Trending Movies\n"
-        "🆕 /latest - Latest Movies\n"
-        "🌐 /lang ml Premalu - Language Search\n"
-        "🔍 /advanced ml 2024 - Advanced Search\n"
-        "🎭 /actor Fahadh Faasil - Actor Search\n"
-        "📺 /tv Stranger Things - TV Series\n"
-        "📱 /where Premalu - Legal Streaming Info\n"
-        "🌍 /public Charlie Chaplin - Archive Search\n\n"
-        "Languages: ml, ta, hi, en"
+        "🎬 <b>WELCOME TO MY CINEMA BOT ❤️</b>\n\n"
+        "/search Premalu - Search movies\n"
+        "/trending - Trending movies\n"
+        "/latest - Latest movies\n"
+        "/lang ml Premalu - Language search\n"
+        "/advanced ml 2024 - Advanced search\n"
+        "/actor Fahadh Faasil - Actor search\n"
+        "/tv Stranger Things - TV search\n"
+        "/where Premalu - Legal streaming search\n"
+        "/file_search Premalu - Search group files",
+        parse_mode="HTML"
     )
 
 
 @bot.message_handler(commands=["search"])
 def search(message):
-    try:
-        query = message.text.replace("/search", "", 1).strip()
-        if not query:
-            bot.reply_to(message, "Example: /search Premalu")
-            return
-
-        data = tmdb("/search/movie", {"query": query})
-        show_list(
-            message.chat.id,
-            data.get("results", []),
-            f"🎬 SEARCH: {query}"
-        )
-    except Exception as e:
-        print("Search:", e)
-        bot.reply_to(message, "Search error!")
+    q = message.text.replace("/search", "", 1).strip()
+    if not q:
+        return bot.reply_to(message, "Use: /search Premalu")
+    data = tmdb("/search/movie", {"query": q})
+    show_movies(message.chat.id, data.get("results", []))
 
 
 @bot.message_handler(commands=["trending"])
 def trending(message):
-    try:
-        data = tmdb("/trending/movie/week")
-        show_list(
-            message.chat.id,
-            data.get("results", []),
-            "🔥 TRENDING MOVIES"
-        )
-    except Exception as e:
-        print("Trending:", e)
-        bot.reply_to(message, "Trending error!")
+    data = tmdb("/trending/movie/week")
+    show_movies(message.chat.id, data.get("results", []))
 
 
 @bot.message_handler(commands=["latest"])
 def latest(message):
-    try:
-        data = tmdb("/discover/movie", {
-            "sort_by": "release_date.desc",
-            "primary_release_date.lte": str(date.today()),
-            "vote_count.gte": 5
-        })
-        show_list(
-            message.chat.id,
-            data.get("results", []),
-            "🆕 LATEST MOVIES"
-        )
-    except Exception as e:
-        print("Latest:", e)
-        bot.reply_to(message, "Latest error!")
+    data = tmdb("/movie/now_playing")
+    show_movies(message.chat.id, data.get("results", []))
 
 
 @bot.message_handler(commands=["lang"])
-def language_search(message):
-    try:
-        parts = message.text.split(maxsplit=2)
-        if len(parts) < 3:
-            bot.reply_to(
-                message,
-                "Example: /lang ml Premalu\n"
-                "Languages: ml, ta, hi, en"
-            )
-            return
+def lang(message):
+    parts = message.text.split(maxsplit=2)
+    if len(parts) < 3:
+        return bot.reply_to(message, "Use: /lang ml Premalu")
 
-        code = LANGUAGES.get(parts[1].lower())
-        query = parts[2]
+    codes = {"ml": "ml", "ta": "ta", "hi": "hi", "en": "en"}
+    code = codes.get(parts[1].lower())
+    if not code:
+        return bot.reply_to(message, "Use ml, ta, hi or en.")
 
-        if not code:
-            bot.reply_to(message, "Use ml, ta, hi or en.")
-            return
-
-        data = tmdb("/search/movie", {
-            "query": query,
-            "language": code
-        })
-
-        results = [
-            x for x in data.get("results", [])
-            if x.get("original_language") == code[:2]
-        ]
-
-        show_list(
-            message.chat.id,
-            results,
-            f"🌐 {parts[1].upper()} MOVIES"
-        )
-    except Exception as e:
-        print("Language:", e)
-        bot.reply_to(message, "Language search error!")
+    data = tmdb("/search/movie", {
+        "query": parts[2], "language": code
+    })
+    results = [
+        x for x in data.get("results", [])
+        if x.get("original_language") == code
+    ]
+    show_movies(message.chat.id, results)
 
 
 @bot.message_handler(commands=["advanced"])
 def advanced(message):
-    try:
-        parts = message.text.split()
+    parts = message.text.split()
+    if len(parts) < 3:
+        return bot.reply_to(message, "Use: /advanced ml 2024")
 
-        if len(parts) < 3:
-            bot.reply_to(
-                message,
-                "Example: /advanced ml 2024\n"
-                "Languages: ml, ta, hi, en"
-            )
-            return
-
-        code = LANGUAGES.get(parts[1].lower())
-        year = parts[2]
-
-        if not code or not year.isdigit() or len(year) != 4:
-            bot.reply_to(message, "Example: /advanced ml 2024")
-            return
-
-        data = tmdb("/discover/movie", {
-            "with_original_language": code[:2],
-            "primary_release_year": year,
-            "sort_by": "popularity.desc"
-        })
-
-        show_list(
-            message.chat.id,
-            data.get("results", []),
-            f"🔍 {parts[1].upper()} MOVIES - {year}"
-        )
-    except Exception as e:
-        print("Advanced:", e)
-        bot.reply_to(message, "Advanced search error!")
+    data = tmdb("/discover/movie", {
+        "with_original_language": parts[1],
+        "primary_release_year": parts[2],
+        "sort_by": "popularity.desc"
+    })
+    show_movies(message.chat.id, data.get("results", []))
 
 
 @bot.message_handler(commands=["actor"])
 def actor(message):
-    try:
-        query = message.text.replace("/actor", "", 1).strip()
-        if not query:
-            bot.reply_to(message, "Example: /actor Fahadh Faasil")
-            return
+    q = message.text.replace("/actor", "", 1).strip()
+    if not q:
+        return bot.reply_to(message, "Use: /actor Fahadh Faasil")
 
-        data = tmdb("/search/person", {"query": query})
-
-        show_list(
-            message.chat.id,
-            data.get("results", []),
-            f"🎭 ACTORS: {query}",
-            "person"
-        )
-    except Exception as e:
-        print("Actor:", e)
-        bot.reply_to(message, "Actor search error!")
+    data = tmdb("/search/person", {"query": q})
+    markup = telebot.types.InlineKeyboardMarkup()
+    for p in data.get("results", [])[:8]:
+        markup.add(telebot.types.InlineKeyboardButton(
+            p["name"], callback_data=f"person_{p['id']}"
+        ))
+    bot.send_message(message.chat.id, "🎭 Select actor:", reply_markup=markup)
 
 
 @bot.message_handler(commands=["tv"])
 def tv(message):
-    try:
-        query = message.text.replace("/tv", "", 1).strip()
-        if not query:
-            bot.reply_to(message, "Example: /tv Stranger Things")
-            return
+    q = message.text.replace("/tv", "", 1).strip()
+    if not q:
+        return bot.reply_to(message, "Use: /tv Stranger Things")
 
-        data = tmdb("/search/tv", {"query": query})
-
-        show_list(
-            message.chat.id,
-            data.get("results", []),
-            f"📺 TV SERIES: {query}",
-            "tv"
-        )
-    except Exception as e:
-        print("TV:", e)
-        bot.reply_to(message, "TV search error!")
+    data = tmdb("/search/tv", {"query": q})
+    markup = telebot.types.InlineKeyboardMarkup()
+    for x in data.get("results", [])[:10]:
+        markup.add(telebot.types.InlineKeyboardButton(
+            x["name"], callback_data=f"tv_{x['id']}"
+        ))
+    bot.send_message(message.chat.id, "📺 Select TV series:", reply_markup=markup)
 
 
 @bot.message_handler(commands=["where"])
 def where(message):
-    try:
-        query = message.text.replace("/where", "", 1).strip()
-        if not query:
-            bot.reply_to(message, "Example: /where Premalu")
-            return
+    q = message.text.replace("/where", "", 1).strip()
+    if not q:
+        return bot.reply_to(message, "Use: /where Premalu")
 
-        data = tmdb("/search/movie", {"query": query})
-        results = data.get("results", [])
-
-        if not results:
-            bot.reply_to(message, "Movie not found.")
-            return
-
-        movie = results[0]
-        providers = tmdb(
-            f"/movie/{movie['id']}/watch/providers"
-        )
-
-        india = providers.get("results", {}).get("IN", {})
-        link = india.get("link")
-
-        kb = InlineKeyboardMarkup()
-        if link:
-            kb.add(InlineKeyboardButton(
-                "📱 CHECK LEGAL STREAMING OPTIONS",
-                url=link
-            ))
-
-        names = []
-        for category in ("flatrate", "rent", "buy"):
-            for item in india.get(category, []):
-                if item["provider_name"] not in names:
-                    names.append(item["provider_name"])
-
-        text = (
-            f"🎬 {movie.get('title')}\n\n"
-            "📱 Legal viewing options in India:\n"
-            + ("\n".join("• " + x for x in names)
-               if names else "No provider information available.")
-        )
-
-        bot.send_message(
-            message.chat.id,
-            text,
-            reply_markup=kb
-        )
-    except Exception as e:
-        print("Where:", e)
-        bot.reply_to(message, "Streaming search error!")
-
-
-@bot.message_handler(commands=["public"])
-def public(message):
-    try:
-        query = message.text.replace("/public", "", 1).strip()
-        if not query:
-            bot.reply_to(
-                message,
-                "Example: /public Charlie Chaplin"
-            )
-            return
-
-        params = {
-            "q": f'title:({query}) AND mediatype:movies',
-            "fl[]": ["identifier", "title"],
-            "rows": 5,
-            "output": "json"
-        }
-
-        r = requests.get(
-            "https://archive.org/advancedsearch.php",
-            params=params,
-            timeout=20
-        )
-        r.raise_for_status()
-
-        docs = r.json().get("response", {}).get("docs", [])
-
-        if not docs:
-            bot.reply_to(message, "No archive results found.")
-            return
-
-        for item in docs:
-            identifier = item.get("identifier")
-            title = item.get("title", "Archive Movie")
-
-            kb = InlineKeyboardMarkup()
-            kb.add(InlineKeyboardButton(
-                "🌍 OPEN ARCHIVE",
-                url=f"https://archive.org/details/{identifier}"
-            ))
-
-            bot.send_message(
-                message.chat.id,
-                f"🎬 {title}\nCheck the item's rights before downloading.",
-                reply_markup=kb
-            )
-    except Exception as e:
-        print("Public:", e)
-        bot.reply_to(message, "Archive search error!")
-
-
-@bot.callback_query_handler(
-    func=lambda call: call.data.startswith(
-        ("movie_", "tv_", "person_")
+    from urllib.parse import quote
+    url = "https://www.justwatch.com/in/search?q=" + quote(q)
+    markup = telebot.types.InlineKeyboardMarkup()
+    markup.add(telebot.types.InlineKeyboardButton(
+        "Find legal streaming options", url=url
+    ))
+    bot.send_message(
+        message.chat.id,
+        "🎬 Check official streaming availability:",
+        reply_markup=markup
     )
-)
-def callback(call):
+
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("movie_"))
+def movie_callback(call):
+    movie_id = call.data.split("_")[1]
+    CURRENT_CHAT[0] = call.message.chat.id
     try:
-        bot.answer_callback_query(call.id)
+        movie_info(movie_id)
+    except Exception:
+        bot.send_message(call.message.chat.id, "Movie details unavailable.")
+    bot.answer_callback_query(call.id)
 
-        kind, item_id = call.data.split("_", 1)
-        chat_id = call.message.chat.id
 
-        if kind == "movie":
-            show_movie(chat_id, item_id)
-        elif kind == "tv":
-            show_tv(chat_id, item_id)
-        elif kind == "person":
-            show_actor(chat_id, item_id)
+@bot.callback_query_handler(func=lambda c: c.data.startswith("tv_"))
+def tv_callback(call):
+    try:
+        x = tmdb("/tv/" + call.data.split("_")[1])
+        text = (
+            f"📺 <b>{x.get('name')}</b>\n"
+            f"⭐ Rating: {x.get('vote_average')}/10\n"
+            f"📅 First aired: {x.get('first_air_date')}\n\n"
+            f"{x.get('overview') or ''}"
+        )
+        if x.get("poster_path"):
+            bot.send_photo(
+                call.message.chat.id, IMG + x["poster_path"],
+                caption=text, parse_mode="HTML"
+            )
+        else:
+            bot.send_message(call.message.chat.id, text, parse_mode="HTML")
+    except Exception:
+        bot.send_message(call.message.chat.id, "TV details unavailable.")
+    bot.answer_callback_query(call.id)
 
-    except Exception as e:
-        print("Callback:", e)
+
+@bot.callback_query_handler(func=lambda c: c.data.startswith("person_"))
+def person_callback(call):
+    try:
+        p = tmdb("/person/" + call.data.split("_")[1],
+                 {"append_to_response": "combined_credits"})
+        movies = p.get("combined_credits", {}).get("cast", [])[:10]
         bot.send_message(
             call.message.chat.id,
-            "Details error. Try again."
+            "🎭 <b>" + p["name"] + "</b>\n\n" +
+            "\n".join(
+                "• " + (x.get("title") or x.get("name", ""))
+                for x in movies
+            ),
+            parse_mode="HTML"
         )
+    except Exception:
+        bot.send_message(call.message.chat.id, "Actor details unavailable.")
+    bot.answer_callback_query(call.id)
+
+
+# SAVE MOVIE FILES SENT TO GROUP
+@bot.message_handler(
+    content_types=["video", "document", "audio", "animation"]
+)
+def save_group_file(message):
+    if message.chat.type not in ["group", "supergroup"]:
+        return
+
+    title = message.caption or ""
+
+    if message.video:
+        file_id = message.video.file_id
+        kind = "video"
+        title = title or "video"
+    elif message.document:
+        file_id = message.document.file_id
+        kind = "document"
+        title = title or message.document.file_name or "file"
+    elif message.audio:
+        file_id = message.audio.file_id
+        kind = "audio"
+        title = title or message.audio.file_name or "audio"
+    else:
+        file_id = message.animation.file_id
+        kind = "animation"
+        title = title or "animation"
+
+    db.execute(
+        "INSERT INTO files(chat_id,title,file_id,kind) VALUES(?,?,?,?)",
+        (message.chat.id, title.lower(), file_id, kind)
+    )
+    db.commit()
+    bot.reply_to(message, "✅ File saved in movie search index!")
+
+
+def search_group_files(message, query):
+    rows = db.execute(
+        "SELECT file_id,kind,title FROM files "
+        "WHERE chat_id=? AND title LIKE ? LIMIT 5",
+        (message.chat.id, "%" + query.lower() + "%")
+    ).fetchall()
+
+    if not rows:
+        bot.reply_to(message, "❌ File not found. Upload it to this group first.")
+        return
+
+    for file_id, kind, title in rows:
+        caption = "🎬 " + title
+        if kind == "video":
+            bot.send_video(message.chat.id, file_id, caption=caption)
+        elif kind == "audio":
+            bot.send_audio(message.chat.id, file_id, caption=caption)
+        elif kind == "animation":
+            bot.send_animation(message.chat.id, file_id, caption=caption)
+        else:
+            bot.send_document(message.chat.id, file_id, caption=caption)
+
+
+@bot.message_handler(commands=["file_search"])
+def file_search(message):
+    q = message.text.replace("/file_search", "", 1).strip()
+    if not q:
+        return bot.reply_to(message, "Use: /file_search Premalu")
+    search_group_files(message, q)
+
+
+# SEARCH FILES WHEN A NAME IS TYPED IN THE GROUP
+@bot.message_handler(
+    func=lambda m: m.chat.type in ["group", "supergroup"]
+    and bool(m.text) and not m.text.startswith("/")
+)
+def group_text_search(message):
+    search_group_files(message, message.text.strip())
+
+
+# WEBHOOK
+@app.route("/", methods=["GET"])
+def home():
+    return "My Cinema Bot is running!"
+
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    if request.headers.get("content-type") == "application/json":
+        update = telebot.types.Update.de_json(
+            request.get_data().decode("utf-8")
+        )
+        bot.process_new_updates([update])
+        return "OK", 200
+    return "Invalid", 403
+
+
+bot.set_webhook(url=BASE_URL.rstrip("/") + "/webhook")
 
 
 if __name__ == "__main__":
-    bot.set_webhook(url=WEBHOOK_URL + "/webhook")
-    print("MY CINEMA WEBHOOK READY ❤️")
-
-    app.run(
-        host="0.0.0.0",
-        port=int(os.environ.get("PORT", 10000))
-    )
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
